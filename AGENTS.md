@@ -17,6 +17,8 @@ RST on GPIO9
 BL on GPIO7
 
 ## TF Card
+Use FatFS for tf card.
+
 SCK on GPIO36
 SDIO CMD/MOSI on GPIO35
 SDIO D0/MISO on GPIO37

@@ -107,3 +107,42 @@ config GEEK_LVGL_TASK_STACK
     default 4096
 
 endmenu
+
+menu "Geek Recorder Network"
+
+config GEEK_WS_ENABLE
+    bool "Enable ASR WebSocket client"
+    default y
+
+config GEEK_WS_URI
+    string "WebSocket URI"
+    default "wss://dashscope.aliyuncs.com/api-ws/v1/inference"
+    help
+      Full WebSocket URI. Adjust if the service endpoint changes.
+
+config GEEK_WS_ORIGIN
+    string "WebSocket Origin header (optional)"
+    default "https://dashscope.aliyuncs.com"
+    help
+      Optional Origin header value. Leave empty to omit.
+
+config GEEK_WS_SUBPROTOCOL
+    string "WebSocket Sec-WebSocket-Protocol (optional)"
+    default ""
+    help
+      Optional subprotocol required by some services. Leave empty to omit.
+
+endmenu
+
+menu "Geek Recorder Debug"
+
+config GEEK_DEBUG_LOG_WIFI_CREDENTIALS
+    bool "Log Wi-Fi SSID and password in plaintext (DANGEROUS)"
+    default n
+    help
+      When enabled, the firmware will print the saved/provisioned Wi-Fi SSID
+      and password in plaintext to the serial log for troubleshooting. This is
+      extremely insecure and should NEVER be enabled in production or when
+      logs may be shared. Disable immediately after debugging.
+
+endmenu

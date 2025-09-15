@@ -15,4 +15,5 @@ void lcd_text_clear(void);
 void lcd_text_println(const char *s);
 void lcd_text_render(void);
 void lcd_text_set_colors(uint16_t fg, uint16_t bg);
-
+// Always-on single-line status at the top
+void lcd_text_set_status_line(const char *s);

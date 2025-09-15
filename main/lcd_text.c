@@ -16,6 +16,8 @@ static uint16_t s_bg = 0x0000; // black
 static char *s_buf = NULL;      // text buffer rows*cols
 static int s_cursor_row = 0;    // next write row (scroll)
 static uint16_t *s_frame = NULL; // RGB565 framebuffer for text area (rows*8 height)
+static char s_status[128] = {0};
+static bool s_status_enabled = true;
 
 static inline uint16_t rgb565(uint8_t r, uint8_t g, uint8_t b) {
     return ((r & 0xF8) << 8) | ((g & 0xFC) << 3) | (b >> 3);
@@ -29,10 +31,12 @@ void lcd_text_init(esp_lcd_panel_handle_t panel, int lcd_w, int lcd_h, const lcd
 {
     s_panel = panel; s_lcd_w = lcd_w; s_lcd_h = lcd_h;
     s_cols = cfg && cfg->cols ? cfg->cols : (lcd_w / 8);
-    s_rows = cfg && cfg->rows ? cfg->rows : (lcd_h / 8);
+    int total_rows = cfg && cfg->rows ? cfg->rows : (lcd_h / 8);
+    // Reserve one row for status line always
+    s_rows = total_rows > 1 ? (total_rows - 1) : total_rows;
     s_fg = cfg ? cfg->fg : 0xFFFF;
     s_bg = cfg ? cfg->bg : 0x0000;
-    size_t sz = (size_t)s_cols * s_rows;
+    size_t sz = (size_t)s_cols * s_rows; // content rows only
     s_buf = (char *)heap_caps_calloc(sz, 1, MALLOC_CAP_DEFAULT);
     s_frame = (uint16_t *)heap_caps_malloc((size_t)s_cols * 8 * s_rows * 8 * sizeof(uint16_t), MALLOC_CAP_DMA);
     if (!s_buf || !s_frame) {
@@ -72,21 +76,31 @@ void lcd_text_render(void)
 {
     if (!s_buf || !s_frame) return;
     int fb_w = s_cols * 8;
-    int fb_h = s_rows * 8;
+    int fb_h = (s_rows + (s_status_enabled ? 1 : 0)) * 8;
     // paint bg
     for (int i = 0; i < fb_w * fb_h; ++i) s_frame[i] = s_bg;
     // draw glyphs
+    int row0 = 0;
+    if (s_status_enabled) {
+        // Draw status on row 0
+        const char *p = s_status;
+        int col = 0;
+        while (*p && col < s_cols) {
+            draw_glyph_to_fb(col++, row0, (unsigned char)(*p >= 0x20 && *p < 0x80 ? *p : '?'));
+            p++;
+        }
+        row0 = 1;
+    }
+    // Draw content starting at row0
     for (int r = 0; r < s_rows; ++r) {
         for (int c = 0; c < s_cols; ++c) {
             unsigned char ch = (unsigned char)s_buf[r * s_cols + c];
-            draw_glyph_to_fb(c, r, ch);
+            draw_glyph_to_fb(c, row0 + r, ch);
         }
     }
-    // center vertically if fb_h < s_lcd_h
-    int y0 = 0;
-    if (fb_h < s_lcd_h) y0 = (s_lcd_h - fb_h) / 2;
-    // draw
-    esp_lcd_panel_draw_bitmap(s_panel, 0, y0, fb_w, y0 + fb_h, s_frame);
+    // Draw with the status line pinned to the very top of the panel
+    // (do not vertically center, so UI top bar is always at y=0)
+    esp_lcd_panel_draw_bitmap(s_panel, 0, 0, fb_w, fb_h, s_frame);
 }
 
 static void scroll_up(int lines)
@@ -129,3 +143,13 @@ void lcd_text_println(const char *s)
     lcd_text_render();
 }
 
+void lcd_text_set_status_line(const char *s)
+{
+    if (!s) s = "";
+    size_t n = strlen(s);
+    if (n >= sizeof(s_status)) n = sizeof(s_status) - 1;
+    memcpy(s_status, s, n);
+    s_status[n] = 0;
+    s_status_enabled = true;
+    lcd_text_render();
+}

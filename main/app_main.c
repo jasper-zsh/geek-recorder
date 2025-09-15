@@ -50,6 +50,9 @@
 #include "esp_netif.h"
 
 #include "esp_websocket_client.h"
+#include "esp_crt_bundle.h"
+#include "wifi_mgr.h"
+#include "http_server.h"
 
 #include "driver/i2s_std.h"
 #include "driver/i2s_pdm.h"
@@ -104,6 +107,7 @@ static esp_lcd_panel_handle_t s_panel_handle = NULL;
 static SemaphoreHandle_t s_lcd_mutex = NULL;
 static bool s_lvgl_ok = false;
 static lv_obj_t *s_label = NULL;
+static lv_obj_t *s_status_label = NULL;
 static const lv_font_t *s_font_chs = NULL;
 static esp_websocket_client_handle_t s_ws = NULL;
 static volatile bool s_ws_connected = false;
@@ -111,22 +115,58 @@ static volatile bool s_ws_task_started = false;
 static char s_ws_task_id[64] = {0};
 static char s_current_rec_base[128] = {0}; // e.g., /sdcard/rec-YYYYMMDD-HHMMSS
 static FILE *s_transcript_fp = NULL;
-// Track whether we are in provisioning mode (SoftAP available)
-static bool s_provisioning_mode = false;
-// Async Wi-Fi scan state
-static volatile bool s_scan_busy = false;
-static wifi_ap_record_t *s_scan_results = NULL;
-static uint16_t s_scan_count = 0;
-static SemaphoreHandle_t s_scan_mutex = NULL;
+static volatile bool s_recording_on = false;
+
+// Build and push a single-line status string to the UI top bar
+static void ui_update_status_line(void)
+{
+    // Wi‑Fi + IP
+    wifi_ap_record_t ap;
+    bool wifi_ok = (esp_wifi_sta_get_ap_info(&ap) == ESP_OK);
+    char wifi_part[48];
+    if (wifi_ok) snprintf(wifi_part, sizeof(wifi_part), "WiFi:%s %ddBm", (char*)ap.ssid, ap.rssi);
+    else snprintf(wifi_part, sizeof(wifi_part), "WiFi:--");
+
+    char ip_part[24];
+    esp_netif_ip_info_t ipi;
+    esp_netif_t *sta = esp_netif_get_handle_from_ifkey("WIFI_STA_DEF");
+    if (sta && esp_netif_get_ip_info(sta, &ipi) == ESP_OK && ipi.ip.addr != 0) {
+        snprintf(ip_part, sizeof(ip_part), IPSTR, IP2STR(&ipi.ip));
+    } else {
+        strcpy(ip_part, "0.0.0.0");
+    }
+
+    // Record
+    char rec_part[12]; snprintf(rec_part, sizeof(rec_part), "REC:%s", s_recording_on ? "ON" : "OFF");
+
+    // ASR
+    char asr_part[12]; snprintf(asr_part, sizeof(asr_part), "ASR:%s", s_ws_connected ? "ON" : "OFF");
+
+    // Time
+    time_t now = time(NULL); struct tm tm; localtime_r(&now, &tm);
+    char tbuf[12]; snprintf(tbuf, sizeof(tbuf), "%02d:%02d:%02d", tm.tm_hour, tm.tm_min, tm.tm_sec);
+
+    char line[160];
+    snprintf(line, sizeof(line), "%s  |  IP:%s  |  %s  |  %s  |  %s",
+             wifi_part, ip_part, rec_part, asr_part, tbuf);
+
+    if (s_lcd_mutex) xSemaphoreTake(s_lcd_mutex, portMAX_DELAY);
+    if (s_lvgl_ok && s_status_label) {
+        lvgl_port_lock();
+        lv_label_set_text(s_status_label, line);
+        lvgl_port_unlock();
+    } else {
+        lcd_text_set_status_line(line);
+    }
+    if (s_lcd_mutex) xSemaphoreGive(s_lcd_mutex);
+}
 
 // Forward decls
 static esp_err_t lcd_init(void);
 static esp_err_t sdcard_mount(void);
 static esp_err_t mic_init(void);
 static void mic_capture_task(void *arg);
-static esp_err_t start_http_server(httpd_handle_t *out);
 static void show_text(const char *text);
-static esp_err_t wifi_init_sta_or_ap(void);
 static void ws_task(void *arg);
 static void ws_start_if_ready(void);
 
@@ -145,6 +185,8 @@ static void wifi_monitor_task(void *pvParameters)
 }
 
 // BOOT按键检测任务
+static volatile bool s_record_request = false;
+
 static void boot_key_task(void *pvParameters)
 {
     ESP_LOGI(TAG, "BOOT key task started, monitoring GPIO0");
@@ -171,11 +213,6 @@ static void boot_key_task(void *pvParameters)
         // 读取BOOT按键状态（低电平表示按下）
         bool is_pressed = (gpio_get_level(0) == 0);
         
-        // 每5秒打印一次GPIO0状态用于测试
-        if (test_count++ % 50 == 0) {
-            ESP_LOGI(TAG, "GPIO0 level: %d", gpio_get_level(0));
-        }
-        
         // 添加调试日志
         static bool last_state = true; // 默认未按下
         if (is_pressed != last_state) {
@@ -196,39 +233,13 @@ static void boot_key_task(void *pvParameters)
             ESP_LOGI(TAG, "BOOT key released, pressed for %lu ms", (unsigned long)press_duration_ms);
             
             if (press_duration_ms >= 3000) {
-                // 长按3秒或以上 - 清除WiFi凭证，保留API Key
-                ESP_LOGI(TAG, "BOOT key long pressed for %lu ms, entering provisioning mode", (unsigned long)press_duration_ms);
-                
-                // 只清除WiFi凭证，保留API Key
-                nvs_handle_t nvs_handle;
-                if (nvs_open(NVS_NS_WIFI, NVS_READWRITE, &nvs_handle) == ESP_OK) {
-                    nvs_erase_key(nvs_handle, NVS_KEY_SSID);
-                    nvs_erase_key(nvs_handle, NVS_KEY_PASS);
-                    nvs_commit(nvs_handle);
-                    nvs_close(nvs_handle);
-                    ESP_LOGI(TAG, "WiFi credentials cleared, restarting in provisioning mode");
-                    
-                    // 重启设备进入配网模式
-                    esp_restart();
-                } else {
-                    ESP_LOGE(TAG, "Failed to open NVS for clearing WiFi credentials");
-                }
-            } else if (press_duration_ms >= 1000) {
-                // 中等长按1-3秒 - 只清除API Key，保留WiFi配置
-                ESP_LOGI(TAG, "BOOT key medium pressed for %lu ms, clearing API key only", (unsigned long)press_duration_ms);
-                
-                // 只清除API Key
-                nvs_handle_t nvs_handle;
-                if (nvs_open(NVS_NS_APP, NVS_READWRITE, &nvs_handle) == ESP_OK) {
-                    nvs_erase_key(nvs_handle, NVS_KEY_API);
-                    nvs_commit(nvs_handle);
-                    nvs_close(nvs_handle);
-                    ESP_LOGI(TAG, "API Key cleared");
-                } else {
-                    ESP_LOGE(TAG, "Failed to open NVS for clearing API Key");
-                }
+                // 长按≥3秒：切换为配网模式（不清除任何设置）
+                ESP_LOGI(TAG, "BOOT long press: switch to provisioning mode");
+                wifi_mgr_enter_provisioning();
             } else {
-                ESP_LOGI(TAG, "BOOT key short pressed for %lu ms", (unsigned long)press_duration_ms);
+                // 短按：开始/停止录音
+                s_record_request = !s_record_request;
+                ESP_LOGI(TAG, "BOOT short press: recording %s", s_record_request ? "START" : "STOP");
             }
         }
         
@@ -310,10 +321,25 @@ static esp_err_t lcd_init(void)
     s_lvgl_ok = lvgl_port_init(s_panel_handle, LCD_HRES, LCD_VRES, CONFIG_GEEK_LVGL_TASK_STACK);
     if (s_lvgl_ok) {
         lvgl_port_lock();
+        // Set a solid black background to guarantee contrast
+        lv_obj_t *scr = lv_scr_act();
+        lv_obj_set_style_bg_color(scr, lv_color_hex(0x000000), 0);
+        lv_obj_set_style_bg_opa(scr, LV_OPA_COVER, 0);
+        // Status label at the very top
+        s_status_label = lv_label_create(lv_scr_act());
+        lv_obj_set_width(s_status_label, LCD_HRES);
+        lv_obj_align(s_status_label, LV_ALIGN_TOP_LEFT, 0, 0);
+        lv_obj_set_style_text_color(s_status_label, lv_color_hex(0xFFFFFF), 0);
+        // Slightly brighter status text for readability
+        lv_obj_set_style_text_opa(s_status_label, LV_OPA_COVER, 0);
+        // Main log label placed just below status bar using real font line-height
         s_label = lv_label_create(lv_scr_act());
         lv_obj_set_width(s_label, LCD_HRES);
         lv_label_set_long_mode(s_label, LV_LABEL_LONG_WRAP);
-        lv_obj_align(s_label, LV_ALIGN_TOP_LEFT, 0, 0);
+        const lv_font_t *st_font = lv_obj_get_style_text_font(s_status_label, LV_PART_MAIN);
+        int lh = st_font ? lv_font_get_line_height(st_font) : 16;
+        if (lh <= 0) lh = 16;
+        lv_obj_align(s_label, LV_ALIGN_TOP_LEFT, 0, lh + 2);
         lv_label_set_text(s_label, "");
         lvgl_port_unlock();
     }
@@ -479,6 +505,39 @@ static void fixup_wav_header(FILE *f)
     fseek(f, end, SEEK_SET);
 }
 
+static FILE *s_wav_fp = NULL;
+
+static void open_new_wav_if_needed(void)
+{
+    if (s_wav_fp || !s_record_request) return;
+    // Prepare path
+    char path[128];
+    time_t now = time(NULL);
+    struct tm tm;
+    localtime_r(&now, &tm);
+    strftime(s_current_rec_base, sizeof(s_current_rec_base), "/sdcard/rec-%Y%m%d-%H%M%S", &tm);
+    strlcpy(path, s_current_rec_base, sizeof(path));
+    strlcat(path, ".wav", sizeof(path));
+    s_wav_fp = fopen(path, "wb");
+    if (!s_wav_fp) {
+        ESP_LOGE(TAG, "Failed to open %s", path);
+        return;
+    }
+    write_wav_header(s_wav_fp, MIC_SAMPLE_RATE);
+    ESP_LOGI(TAG, "Recording to %s", path);
+    s_recording_on = true;
+}
+
+static void close_wav_if_open(void)
+{
+    if (!s_wav_fp) return;
+    fixup_wav_header(s_wav_fp);
+    fclose(s_wav_fp);
+    s_wav_fp = NULL;
+    s_recording_on = false;
+    ESP_LOGI(TAG, "Recording stopped");
+}
+
 static void mic_capture_task(void *arg)
 {
     ESP_LOGI(TAG, "Mic capture task started");
@@ -490,33 +549,30 @@ static void mic_capture_task(void *arg)
         return;
     }
 
-    // Open rolling WAV + prepare base path for transcript
-    char path[128];
-    time_t now = time(NULL);
-    struct tm tm;
-    localtime_r(&now, &tm);
-    strftime(s_current_rec_base, sizeof(s_current_rec_base), "/sdcard/rec-%Y%m%d-%H%M%S", &tm);
-    // Build path safely (avoid truncation warning)
-    strlcpy(path, s_current_rec_base, sizeof(path));
-    strlcat(path, ".wav", sizeof(path));
-    FILE *f = fopen(path, "wb");
-    if (!f) {
-        ESP_LOGE(TAG, "Failed to open %s", path);
-    } else {
-        write_wav_header(f, MIC_SAMPLE_RATE);
-        ESP_LOGI(TAG, "Recording to %s", path);
-    }
-
     while (1) {
         size_t bytes_read = 0;
         esp_err_t ret = i2s_channel_read(s_pdm_rx_chan, buf, buf_bytes, &bytes_read, pdMS_TO_TICKS(1000));
-        if (ret == ESP_OK && f) {
-            fwrite(buf, 1, bytes_read, f);
+        // Handle recording state transitions
+        if (s_record_request && !s_wav_fp) {
+            open_new_wav_if_needed();
+        } else if (!s_record_request && s_wav_fp) {
+            close_wav_if_open();
+        }
+        if (ret == ESP_OK && s_wav_fp) {
+            fwrite(buf, 1, bytes_read, s_wav_fp);
         }
         // Stream to WS if task started
         if (ret == ESP_OK && s_ws && s_ws_connected && s_ws_task_started) {
             esp_websocket_client_send_bin(s_ws, (const char *)buf, bytes_read, portMAX_DELAY);
         }
+    }
+}
+
+static void status_task(void *arg)
+{
+    while (1) {
+        ui_update_status_line();
+        vTaskDelay(pdMS_TO_TICKS(1000));
     }
 }
 
@@ -540,6 +596,7 @@ static void html_escape(char *dst, size_t dst_sz, const char *src)
     dst[di] = 0;
 }
 
+/* Moved to http_server.c
 static esp_err_t root_get_handler(httpd_req_t *req)
 {
     nvs_handle_t n;
@@ -607,6 +664,7 @@ static esp_err_t root_get_handler(httpd_req_t *req)
     httpd_resp_sendstr_chunk(req, "</ul></body></html>");
     return httpd_resp_send_chunk(req, NULL, 0);
 }
+*/
 
 static esp_err_t parse_form(httpd_req_t *req, char *buf, size_t buf_sz)
 {
@@ -651,6 +709,7 @@ static char *kv_get(char *body, const char *key)
     return NULL;
 }
 
+/* Moved to http_server.c
 static esp_err_t provision_post_handler(httpd_req_t *req)
 {
     char body[512];
@@ -711,6 +770,7 @@ static esp_err_t provision_post_handler(httpd_req_t *req)
     httpd_resp_set_hdr(req, "Location", "/");
     return httpd_resp_send(req, NULL, 0);
 }
+*/
 
 static void send_scan_json(httpd_req_t *req, const wifi_ap_record_t *recs, uint16_t ap_num)
 {
@@ -743,6 +803,7 @@ static void send_scan_json(httpd_req_t *req, const wifi_ap_record_t *recs, uint1
     httpd_resp_send_chunk(req, NULL, 0);
 }
 
+/* Moved to http_server.c
 static esp_err_t scan_start_get_handler(httpd_req_t *req)
 {
     if (!s_scan_mutex) s_scan_mutex = xSemaphoreCreateMutex();
@@ -774,7 +835,9 @@ static esp_err_t scan_start_get_handler(httpd_req_t *req)
         return httpd_resp_sendstr(req, msg);
     }
 }
+*/
 
+/* Moved to http_server.c
 static esp_err_t scan_result_get_handler(httpd_req_t *req)
 {
     if (!s_scan_mutex) s_scan_mutex = xSemaphoreCreateMutex();
@@ -795,6 +858,7 @@ static esp_err_t scan_result_get_handler(httpd_req_t *req)
     httpd_resp_set_type(req, "application/json");
     return httpd_resp_sendstr(req, "[]");
 }
+*/
 
 static esp_err_t download_get_handler(httpd_req_t *req)
 {
@@ -828,218 +892,11 @@ static esp_err_t delete_get_handler(httpd_req_t *req)
     return httpd_resp_send(req, NULL, 0);
 }
 
-static httpd_handle_t s_server = NULL;
-static esp_err_t start_http_server(httpd_handle_t *out)
-{
-    httpd_config_t cfg = HTTPD_DEFAULT_CONFIG();
-    cfg.server_port = HTTP_PORT;
-    cfg.uri_match_fn = httpd_uri_match_wildcard;
-    httpd_handle_t server = NULL;
-    ESP_ERROR_CHECK(httpd_start(&server, &cfg));
+/* HTTP server moved to http_server.c */
 
-    httpd_uri_t root = { .uri = "/", .method = HTTP_GET, .handler = root_get_handler, .user_ctx = NULL };
-    httpd_uri_t provision = { .uri = "/provision", .method = HTTP_POST, .handler = provision_post_handler, .user_ctx = NULL };
-    httpd_uri_t scan_start = { .uri = "/scan_start", .method = HTTP_GET, .handler = scan_start_get_handler, .user_ctx = NULL };
-    httpd_uri_t scan_result = { .uri = "/scan_result", .method = HTTP_GET, .handler = scan_result_get_handler, .user_ctx = NULL };
-    httpd_uri_t download = { .uri = "/download", .method = HTTP_GET, .handler = download_get_handler, .user_ctx = NULL };
-    httpd_uri_t del = { .uri = "/delete", .method = HTTP_GET, .handler = delete_get_handler, .user_ctx = NULL };
-    httpd_register_uri_handler(server, &root);
-    httpd_register_uri_handler(server, &provision);
-    httpd_register_uri_handler(server, &scan_start);
-    httpd_register_uri_handler(server, &scan_result);
-    httpd_register_uri_handler(server, &download);
-    httpd_register_uri_handler(server, &del);
-    *out = server;
-    return ESP_OK;
-}
+/* Wi-Fi events moved to wifi_mgr.c */
 
-static void wifi_event_handler(void* arg, esp_event_base_t event_base,
-                               int32_t event_id, void* event_data)
-{
-    if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_START) {
-        ESP_LOGI(TAG, "WiFi STA started");
-        // Do not auto-connect while in provisioning (AP) mode
-        if (!s_provisioning_mode) {
-            esp_wifi_connect();
-        } else {
-            ESP_LOGI(TAG, "Provisioning mode active: skip STA connect");
-        }
-    } else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_DISCONNECTED) {
-        wifi_event_sta_disconnected_t* disconnected = (wifi_event_sta_disconnected_t*) event_data;
-        ESP_LOGI(TAG, "Disconnected from WiFi (reason: %d), trying to reconnect...", disconnected->reason);
-        
-        // 根据断开原因决定是否重连
-        switch (disconnected->reason) {
-            case WIFI_REASON_NO_AP_FOUND:
-                ESP_LOGW(TAG, "AP not found, will retry...");
-                break;
-            case WIFI_REASON_AUTH_FAIL:
-                ESP_LOGW(TAG, "Authentication failed, check password");
-                break;
-            case WIFI_REASON_ASSOC_LEAVE:
-                ESP_LOGW(TAG, "Association leave");
-                break;
-            case 210: // STA连接超时
-                ESP_LOGW(TAG, "STA connection timeout, check AP availability and signal strength");
-                break;
-            default:
-                ESP_LOGW(TAG, "Other disconnect reason: %d", disconnected->reason);
-                break;
-        }
-        
-        // 延迟一段时间后再重连，避免频繁重连；配网模式下不重连
-        if (!s_provisioning_mode) {
-            vTaskDelay(pdMS_TO_TICKS(2000));
-            esp_wifi_connect();
-        } else {
-            ESP_LOGI(TAG, "Provisioning mode active: skip STA reconnect");
-        }
-    } else if (event_base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP) {
-        ip_event_got_ip_t* event = (ip_event_got_ip_t*) event_data;
-        ESP_LOGI(TAG, "Got IP: " IPSTR, IP2STR(&event->ip_info.ip));
-    } else if (event_base == IP_EVENT && event_id == IP_EVENT_STA_LOST_IP) {
-        ESP_LOGI(TAG, "Lost IP");
-    } else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_SCAN_DONE) {
-        uint16_t ap_num = 0;
-        esp_wifi_scan_get_ap_num(&ap_num);
-        wifi_ap_record_t *recs = NULL;
-        if (ap_num) {
-            recs = malloc(sizeof(wifi_ap_record_t) * ap_num);
-            if (recs) {
-                esp_wifi_scan_get_ap_records(&ap_num, recs);
-            } else {
-                ap_num = 0;
-            }
-        }
-        if (!s_scan_mutex) s_scan_mutex = xSemaphoreCreateMutex();
-        if (s_scan_mutex) xSemaphoreTake(s_scan_mutex, portMAX_DELAY);
-        if (s_scan_results) free(s_scan_results);
-        s_scan_results = recs;
-        s_scan_count = ap_num;
-        s_scan_busy = false;
-        if (s_scan_mutex) xSemaphoreGive(s_scan_mutex);
-        ESP_LOGI(TAG, "Wi-Fi scan done, %u AP(s)", (unsigned)ap_num);
-    } else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_AP_STACONNECTED) {
-        wifi_event_ap_staconnected_t *e = (wifi_event_ap_staconnected_t *)event_data;
-        ESP_LOGI(TAG, "AP: station connected: " MACSTR ", AID=%d", MAC2STR(e->mac), e->aid);
-    } else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_AP_STADISCONNECTED) {
-        wifi_event_ap_stadisconnected_t *e = (wifi_event_ap_stadisconnected_t *)event_data;
-        ESP_LOGW(TAG, "AP: station disconnected: " MACSTR ", AID=%d, reason=%d", MAC2STR(e->mac), e->aid, e->reason);
-    }
-}
-
-static esp_err_t wifi_init_sta_or_ap(void)
-{
-    ESP_ERROR_CHECK(esp_netif_init());
-    ESP_ERROR_CHECK(esp_event_loop_create_default());
-    
-    // Register event handlers
-    ESP_ERROR_CHECK(esp_event_handler_register(WIFI_EVENT, ESP_EVENT_ANY_ID, &wifi_event_handler, NULL));
-    ESP_ERROR_CHECK(esp_event_handler_register(IP_EVENT, IP_EVENT_STA_GOT_IP, &wifi_event_handler, NULL));
-    ESP_ERROR_CHECK(esp_event_handler_register(IP_EVENT, IP_EVENT_STA_LOST_IP, &wifi_event_handler, NULL));
-    
-    wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
-    ESP_ERROR_CHECK(esp_wifi_init(&cfg));
-    // Use RAM storage so the driver won't auto-use any previously saved STA config
-    ESP_ERROR_CHECK(esp_wifi_set_storage(WIFI_STORAGE_RAM));
-
-    nvs_handle_t n;
-    char ssid[33] = {0};
-    char pass[65] = {0};
-    size_t len;
-    bool have_creds = false;
-    if (nvs_open(NVS_NS_WIFI, NVS_READONLY, &n) == ESP_OK) {
-        len = sizeof(ssid);
-        if (nvs_get_str(n, NVS_KEY_SSID, ssid, &len) == ESP_OK && strlen(ssid) > 0) {
-            len = sizeof(pass);
-            if (nvs_get_str(n, NVS_KEY_PASS, pass, &len) == ESP_OK) {
-                // 检查密码长度是否合法（WPA2要求至少8位）
-                if (strlen(pass) >= 8 || strlen(pass) == 0) {  // 0表示开放网络
-                    have_creds = true;
-                } else {
-                    ESP_LOGW(TAG, "WiFi password too short (%d chars), ignoring WiFi config", strlen(pass));
-                }
-            }
-        }
-        nvs_close(n);
-    }
-
-    // Set WiFi mode first
-    s_provisioning_mode = !have_creds;
-    if (s_provisioning_mode) {
-        ESP_LOGI(TAG, "No valid WiFi credentials found -> provisioning mode (AP+STA for scan, no STA connect)");
-        ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_APSTA));
-        // Keep AP responsive during provisioning
-        ESP_ERROR_CHECK(esp_wifi_set_ps(WIFI_PS_NONE));
-    } else {
-        ESP_LOGI(TAG, "Valid WiFi credentials found -> normal mode (STA only)");
-        ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
-    }
-
-    // Create network interfaces
-    esp_netif_t *sta = esp_netif_create_default_wifi_sta();
-    if (s_provisioning_mode) {
-        esp_netif_t *ap = esp_netif_create_default_wifi_ap();
-        
-        // Configure AP with optimized settings
-        wifi_config_t wifi_ap = {0};
-        char ap_ssid[32];
-        uint8_t mac[6];
-        esp_read_mac(mac, ESP_MAC_WIFI_SOFTAP);
-        snprintf(ap_ssid, sizeof(ap_ssid), "GeekRecorder-%02X%02X", mac[4], mac[5]);
-        strncpy((char *)wifi_ap.ap.ssid, ap_ssid, sizeof(wifi_ap.ap.ssid));
-        wifi_ap.ap.ssid_len = strlen(ap_ssid);
-        wifi_ap.ap.channel = 1;  // 固定使用信道1，减少干扰
-        wifi_ap.ap.max_connection = 4;
-        // Provisioning AP: WPA2-PSK if AP_PASSWORD >= 8, else open
-        if (strlen(AP_PASSWORD) >= 8) {
-            wifi_ap.ap.authmode = WIFI_AUTH_WPA2_PSK;
-            strncpy((char *)wifi_ap.ap.password, AP_PASSWORD, sizeof(wifi_ap.ap.password));
-        } else {
-            wifi_ap.ap.authmode = WIFI_AUTH_OPEN;
-        }
-        // 优化AP配置参数
-        wifi_ap.ap.ssid_hidden = false;
-        wifi_ap.ap.beacon_interval = 100;  // 减少beacon间隔以提高连接稳定性
-        if (wifi_ap.ap.authmode != WIFI_AUTH_OPEN) {
-            wifi_ap.ap.pairwise_cipher = WIFI_CIPHER_TYPE_CCMP;  // 使用更强的加密
-        }
-        
-        ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_AP, &wifi_ap));
-        ESP_LOGI(TAG, "AP configured. SSID: %s, Channel: %d", ap_ssid, wifi_ap.ap.channel);
-    }
-
-    // Configure STA only in normal mode
-    if (!s_provisioning_mode) {
-        wifi_config_t wifi_sta = {0};
-        ESP_LOGI(TAG, "Configuring Wi-Fi STA with SSID=%s", ssid);
-        strncpy((char *)wifi_sta.sta.ssid, ssid, sizeof(wifi_sta.sta.ssid));
-        strncpy((char *)wifi_sta.sta.password, pass, sizeof(wifi_sta.sta.password));
-        
-        // 添加一些WiFi配置参数来改善连接
-        wifi_sta.sta.threshold.authmode = WIFI_AUTH_WPA2_PSK;
-        wifi_sta.sta.threshold.rssi = -120;
-        wifi_sta.sta.scan_method = WIFI_ALL_CHANNEL_SCAN;
-        wifi_sta.sta.sort_method = WIFI_CONNECT_AP_BY_SIGNAL;
-        wifi_sta.sta.bssid_set = false;  // 不绑定特定BSSID
-        wifi_sta.sta.listen_interval = 3; // 减少监听间隔以节省电量
-        
-        ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wifi_sta));
-    }
-
-    ESP_ERROR_CHECK(esp_wifi_start());
-    ESP_LOGI(TAG, "Wi-Fi started");
-    
-    // Only try to connect if not in provisioning
-    if (!s_provisioning_mode) {
-        ESP_LOGI(TAG, "Attempting to connect to WiFi network: %s", ssid);
-        esp_wifi_connect();
-    } else {
-        ESP_LOGW(TAG, "Provisioning mode active, skipping STA connection attempts");
-    }
-    
-    return ESP_OK;
-}
+/* Wi-Fi init moved to wifi_mgr.c */
 
 // --- WebSocket ASR ---
 
@@ -1209,17 +1066,29 @@ static void ws_task(void *arg)
         return;
     }
 
-    char auth_hdr[256];
-    snprintf(auth_hdr, sizeof(auth_hdr), "Authorization: bearer %s", api_key);
+    char auth_hdr[400];
+    // Build headers: Authorization + optional Origin
+    if (strlen(CONFIG_GEEK_WS_ORIGIN) > 0)
+        snprintf(auth_hdr, sizeof(auth_hdr),
+                 "Authorization: Bearer %s\r\nOrigin: %s",
+                 api_key, CONFIG_GEEK_WS_ORIGIN);
+    else
+        snprintf(auth_hdr, sizeof(auth_hdr),
+                 "Authorization: Bearer %s",
+                 api_key);
 
     esp_websocket_client_config_t cfg = {
-        .uri = "wss://dashscope.aliyuncs.com/api-ws/v1/inference",
+        .uri = CONFIG_GEEK_WS_URI,
         .headers = auth_hdr,
+        .subprotocol = (strlen(CONFIG_GEEK_WS_SUBPROTOCOL) ? CONFIG_GEEK_WS_SUBPROTOCOL : NULL),
         .network_timeout_ms = 10000,
         .reconnect_timeout_ms = 5000,
-        .use_global_ca_store = true,
+        // Use IDF certificate bundle so we don't need to preload global CA store
+        .crt_bundle_attach = esp_crt_bundle_attach,
     };
     s_ws = esp_websocket_client_init(&cfg);
+    ESP_LOGI(TAG, "WS init: uri=%s, subprotocol=%s", CONFIG_GEEK_WS_URI,
+             strlen(CONFIG_GEEK_WS_SUBPROTOCOL) ? CONFIG_GEEK_WS_SUBPROTOCOL : "<none>");
     esp_websocket_register_events(s_ws, WEBSOCKET_EVENT_ANY, ws_event_handler, NULL);
     esp_websocket_client_start(s_ws);
 
@@ -1256,10 +1125,8 @@ void app_main(void)
     
     ESP_ERROR_CHECK(nvs_flash_init());
 
-    // Init LCD early for status
-    if (lcd_init() == ESP_OK) {
-        show_text("Booting...");
-    }
+    // Init LCD early for status (no 'Booting' banner after startup)
+    lcd_init();
 
     // Mount TF
     bool sd_ok = (sdcard_mount() == ESP_OK);
@@ -1267,8 +1134,11 @@ void app_main(void)
         ESP_LOGW(TAG, "SD card not mounted");
     }
 
-    // Init Wi-Fi (AP for provisioning + STA if creds present)
-    wifi_init_sta_or_ap();
+    // Init Wi-Fi (provisioning AP or STA)
+    wifi_mgr_init();
+
+    // Start status bar updater
+    xTaskCreatePinnedToCore(status_task, "ui_status", 4096, NULL, 4, NULL, tskNO_AFFINITY);
     
     // Initialize SNTP for time synchronization after Wi-Fi is initialized
     // 添加延迟确保网络栈完全初始化
@@ -1300,7 +1170,7 @@ void app_main(void)
     }
 
     // HTTP server for provisioning + file mgmt
-    start_http_server(&s_server);
+    http_server_start(NULL);
 
     // Start ASR WS client (if API key exists)
     ws_start_if_ready();

@@ -22,3 +22,5 @@ CONFIG_PARTITION_TABLE_FILENAME="partitions.csv"
 CONFIG_LV_COLOR_DEPTH_16=y
 CONFIG_LV_COLOR_DEPTH_32=n
 CONFIG_LV_COLOR_16_SWAP=y
+# Debug: print plaintext Wi‑Fi credentials (DANGEROUS; enable only for local debugging)
+CONFIG_GEEK_DEBUG_LOG_WIFI_CREDENTIALS=y

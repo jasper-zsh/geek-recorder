@@ -619,6 +619,7 @@ CONFIG_GEEK_SDMMC_D1=33
 CONFIG_GEEK_SDMMC_D2=38
 CONFIG_GEEK_SDMMC_D3=34
 CONFIG_GEEK_HTTP_PORT=80
+CONFIG_GEEK_AP_PASSWORD="geek12345"
 # end of Geek Recorder Configuration
 
 #
@@ -627,6 +628,21 @@ CONFIG_GEEK_HTTP_PORT=80
 CONFIG_GEEK_USE_LVGL=y
 CONFIG_GEEK_LVGL_TASK_STACK=4096
 # end of Geek Recorder UI
+
+#
+# Geek Recorder Network
+#
+CONFIG_GEEK_WS_ENABLE=y
+CONFIG_GEEK_WS_URI="wss://dashscope.aliyuncs.com/api-ws/v1/inference"
+CONFIG_GEEK_WS_ORIGIN="https://dashscope.aliyuncs.com"
+CONFIG_GEEK_WS_SUBPROTOCOL=""
+# end of Geek Recorder Network
+
+#
+# Geek Recorder Debug
+#
+CONFIG_GEEK_DEBUG_LOG_WIFI_CREDENTIALS=y
+# end of Geek Recorder Debug
 
 #
 # Compiler options
