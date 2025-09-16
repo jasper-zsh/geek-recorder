@@ -247,15 +247,39 @@ static esp_err_t download_get_handler(httpd_req_t *req)
     char query[256]; char f[192];
     if (httpd_req_get_url_query_str(req, query, sizeof(query)) != ESP_OK) return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "no query");
     if (httpd_query_key_value(query, "f", f, sizeof(f)) != ESP_OK) return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "no f");
-    char full[256]; snprintf(full, sizeof(full), "/sdcard/%s", f);
+    // sanitize: strip any path and reject parent traversal
+    const char *name = f;
+    for (const char *p = f; *p; ++p) { if (*p == '/') name = p + 1; }
+    if (strstr(name, "..")) return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "bad name");
+
+    char full[256]; snprintf(full, sizeof(full), "/sdcard/%s", name);
+    struct stat st; if (stat(full, &st) != 0 || !S_ISREG(st.st_mode)) return httpd_resp_send_err(req, HTTPD_404_NOT_FOUND, "not found");
     FILE *fp = fopen(full, "rb");
     if (!fp) return httpd_resp_send_err(req, HTTPD_404_NOT_FOUND, "not found");
-    httpd_resp_set_type(req, "application/octet-stream");
-    httpd_resp_set_hdr(req, "Content-Disposition", "attachment");
-    char buf[1024]; size_t n;
-    while ((n = fread(buf, 1, sizeof(buf), fp)) > 0) {
-        if (httpd_resp_send_chunk(req, buf, n) != ESP_OK) break;
+    // set content type by extension
+    const char *ctype = "application/octet-stream";
+    size_t namelen = strlen(name);
+    if (namelen >= 4 && strcasecmp(name + namelen - 4, ".wav") == 0) ctype = "audio/wav";
+    httpd_resp_set_type(req, ctype);
+    // Note: use chunked transfer; do NOT set Content-Length while using chunks
+    // Content-Disposition with filename
+    char safe[192]; size_t si = 0;
+    for (const char *p = name; *p && si + 1 < sizeof(safe); ++p) {
+        unsigned char c = (unsigned char)*p;
+        if (c == '"' || c < 0x20) safe[si++] = '_';
+        else safe[si++] = c;
     }
+    safe[si] = 0;
+    char cdisp[256]; snprintf(cdisp, sizeof(cdisp), "attachment; filename=\"%s\"", safe);
+    httpd_resp_set_hdr(req, "Content-Disposition", cdisp);
+    size_t chunk_sz = 2048;
+    uint8_t *buf = (uint8_t *)malloc(chunk_sz);
+    if (!buf) { fclose(fp); return httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "oom"); }
+    size_t n;
+    while ((n = fread(buf, 1, chunk_sz, fp)) > 0) {
+        if (httpd_resp_send_chunk(req, (const char *)buf, n) != ESP_OK) break;
+    }
+    free(buf);
     fclose(fp);
     return httpd_resp_send_chunk(req, NULL, 0);
 }
@@ -279,6 +303,8 @@ esp_err_t http_server_start(httpd_handle_t *out)
     httpd_config_t cfg = HTTPD_DEFAULT_CONFIG();
     cfg.server_port = HTTP_PORT;
     cfg.uri_match_fn = httpd_uri_match_wildcard;
+    // Increase stack to handle page building and downloads safely
+    if (cfg.stack_size < 8192) cfg.stack_size = 8192;
     httpd_handle_t server = NULL;
     ESP_ERROR_CHECK(httpd_start(&server, &cfg));
 
