@@ -1,5 +1,6 @@
 #include <stdio.h>
 #include <string.h>
+#include <math.h>
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -27,6 +28,17 @@ static i2s_chan_handle_t s_pdm_rx_chan = NULL;
 static volatile bool s_record_request = false;
 static volatile bool s_recording_on = false;
 static FILE *s_wav_fp = NULL;
+
+#define MIC_AGC_TARGET_RMS        4000.0f
+#define MIC_AGC_MAX_GAIN          18.0f
+#define MIC_AGC_MIN_GAIN          0.35f
+#define MIC_AGC_ATTACK_ALPHA      0.35f
+#define MIC_AGC_RELEASE_ALPHA     0.010f
+#define MIC_AGC_SILENCE_RMS       100.0f
+#define MIC_AGC_HOLD_BLOCKS       20
+
+static float s_agc_gain = 1.0f;
+static int s_agc_hold_blocks = 0;
 
 // weak symbol hooks for streaming
 __attribute__((weak)) void asr_ws_send_audio(const void *data, size_t len) { (void)data; (void)len; }
@@ -148,6 +160,57 @@ static void close_wav_if_open(void)
     ESP_LOGI(TAG, "Recording stopped");
 }
 
+static inline int16_t saturate_int16(float v)
+{
+    if (v > 32767.0f) return 32767;
+    if (v < -32768.0f) return -32768;
+    return (int16_t)lrintf(v);
+}
+
+static float compute_rms(const int16_t *samples, size_t count)
+{
+    if (!samples || count == 0) {
+        return 0.0f;
+    }
+    double acc = 0.0;
+    for (size_t i = 0; i < count; ++i) {
+        double s = samples[i];
+        acc += s * s;
+    }
+    return (float)sqrt(acc / (double)count);
+}
+
+static void agc_process_block(int16_t *samples, size_t count)
+{
+    if (!samples || count == 0) {
+        return;
+    }
+
+    float rms = compute_rms(samples, count);
+    float desired_gain = s_agc_gain;
+    if (rms < MIC_AGC_SILENCE_RMS) {
+        if (s_agc_hold_blocks > 0) {
+            s_agc_hold_blocks--;
+        } else {
+            desired_gain = MIC_AGC_MIN_GAIN;
+        }
+    } else {
+        s_agc_hold_blocks = MIC_AGC_HOLD_BLOCKS;
+        desired_gain = MIC_AGC_TARGET_RMS / rms;
+    }
+
+    desired_gain = fminf(fmaxf(desired_gain, MIC_AGC_MIN_GAIN), MIC_AGC_MAX_GAIN);
+
+    float alpha = (desired_gain > s_agc_gain) ? MIC_AGC_ATTACK_ALPHA : MIC_AGC_RELEASE_ALPHA;
+    s_agc_gain = s_agc_gain + alpha * (desired_gain - s_agc_gain);
+    s_agc_gain = fminf(fmaxf(s_agc_gain, MIC_AGC_MIN_GAIN), MIC_AGC_MAX_GAIN);
+
+    for (size_t i = 0; i < count; ++i) {
+        float amplified = samples[i] * s_agc_gain;
+        samples[i] = saturate_int16(amplified);
+    }
+}
+
 static void mic_capture_task(void *arg)
 {
     ESP_LOGI(TAG, "Mic capture task started");
@@ -161,6 +224,11 @@ static void mic_capture_task(void *arg)
     while (1) {
         size_t bytes_read = 0;
         esp_err_t ret = i2s_channel_read(s_pdm_rx_chan, buf, buf_bytes, &bytes_read, pdMS_TO_TICKS(1000));
+
+        if (ret == ESP_OK && bytes_read >= sizeof(int16_t)) {
+            agc_process_block((int16_t *)buf, bytes_read / sizeof(int16_t));
+        }
+
         if (s_record_request && !s_wav_fp) {
             open_new_wav_if_needed();
         } else if (!s_record_request && s_wav_fp) {
