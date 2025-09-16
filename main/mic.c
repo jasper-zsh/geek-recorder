@@ -11,6 +11,7 @@
 #include "driver/i2s_pdm.h"
 
 #include "mic.h"
+#include "asr_ws.h"
 #include <time.h>
 #include <errno.h>
 
@@ -181,7 +182,15 @@ void mic_start_task(void)
 
 void mic_set_record_request(bool on)
 {
-    s_record_request = on;
+    if (!on) {
+        // Stop ASR streaming before stopping recording
+        asr_ws_request_streaming(false);
+        s_record_request = false;
+        return;
+    }
+    // Start streaming if connected when starting to record
+    asr_ws_request_streaming(true);
+    s_record_request = true;
 }
 
 bool mic_is_recording(void)

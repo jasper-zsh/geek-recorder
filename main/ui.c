@@ -193,7 +193,12 @@ static void ui_update_status_line_once(void)
     }
 
     char rec_part[12]; snprintf(rec_part, sizeof(rec_part), "REC:%s", mic_is_recording() ? "ON" : "OFF");
-    char asr_part[12]; snprintf(asr_part, sizeof(asr_part), "ASR:%s", asr_ws_connected() ? "ON" : "OFF");
+    const bool asr_conn = asr_ws_connected();
+    const bool asr_strm = asr_ws_streaming();
+    char asr_part[12];
+    if (!asr_conn) snprintf(asr_part, sizeof(asr_part), "ASR:OFF");
+    else if (asr_strm) snprintf(asr_part, sizeof(asr_part), "ASR:ON");
+    else snprintf(asr_part, sizeof(asr_part), "ASR:RDY");
 
     time_t now = time(NULL); struct tm tm; localtime_r(&now, &tm);
     char tbuf[12]; snprintf(tbuf, sizeof(tbuf), "%02d:%02d:%02d", tm.tm_hour, tm.tm_min, tm.tm_sec);

@@ -10,6 +10,7 @@
 #include "nvs.h"
 #include "nvs_flash.h"
 #include "wifi_mgr.h"
+#include "asr_ws.h"
 #include "esp_mac.h"
 
 static const char *TAG = "wifi_mgr";
@@ -224,6 +225,8 @@ static void wifi_event_handler(void* arg, esp_event_base_t event_base,
         ESP_LOGI(TAG, "Got IP: " IPSTR, IP2STR(&event->ip_info.ip));
         // Cancel pending reconnect timer (if any)
         if (s_reconnect_timer) esp_timer_stop(s_reconnect_timer);
+        // Bring up ASR WS connection as soon as we have IP
+        asr_ws_start();
     } else if (event_base == IP_EVENT && event_id == IP_EVENT_STA_LOST_IP) {
         ESP_LOGW(TAG, "Lost IP");
     } else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_SCAN_DONE) {

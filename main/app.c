@@ -88,7 +88,6 @@ void app_main(void)
     }
 
     http_server_start(NULL);
-    asr_ws_start();
 
     if (sd_ok) {
         ui_post_sd_init();
@@ -96,4 +95,3 @@ void app_main(void)
 
     ESP_LOGI(TAG, "System initialized");
 }
-

@@ -40,6 +40,7 @@ library/API documentation. This means you should automatically use the Context7 
 tools to resolve library id and get library docs without me having to explicitly ask.
 
 For ESP32 or ESP-IDF related knowledge, use library /espressif/esp-idf for API and docs.
+For paraformer service, check `references/paraformer.md` instead of context7.
 
 # Build
 Always use idf.py to build this project, DO NOT use cmake directly.
