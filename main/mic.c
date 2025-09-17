@@ -225,9 +225,9 @@ static void mic_capture_task(void *arg)
         size_t bytes_read = 0;
         esp_err_t ret = i2s_channel_read(s_pdm_rx_chan, buf, buf_bytes, &bytes_read, pdMS_TO_TICKS(1000));
 
-        if (ret == ESP_OK && bytes_read >= sizeof(int16_t)) {
-            agc_process_block((int16_t *)buf, bytes_read / sizeof(int16_t));
-        }
+        // if (ret == ESP_OK && bytes_read >= sizeof(int16_t)) {
+        //     agc_process_block((int16_t *)buf, bytes_read / sizeof(int16_t));
+        // }
 
         if (s_record_request && !s_wav_fp) {
             open_new_wav_if_needed();
@@ -259,6 +259,10 @@ void mic_set_record_request(bool on)
     // Start streaming if connected when starting to record
     asr_ws_request_streaming(true);
     s_record_request = true;
+    
+    // Record start time for UI duration display
+    extern void ui_record_started(void);
+    ui_record_started();
 }
 
 bool mic_is_recording(void)

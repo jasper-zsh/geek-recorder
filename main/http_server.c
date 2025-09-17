@@ -9,7 +9,9 @@
 #include "nvs_flash.h"
 #include "wifi_mgr.h"
 #include "http_server.h"
+#include "ui.h"
 #include <ctype.h>
+#include <errno.h>
 
 static const char *TAG = "http_srv";
 
@@ -75,7 +77,11 @@ static esp_err_t root_get_handler(httpd_req_t *req)
     httpd_resp_sendstr_chunk(req, "<datalist id='ssidlist'></datalist>");
     httpd_resp_sendstr_chunk(req, "<div style='margin:6px 0;color:#666;font-size:12px;'>Device supports 2.4&nbsp;GHz (channels 1–13) only.</div>");
     httpd_resp_sendstr_chunk(req, "<div><select id='ssidsel' size='8' style='width:100%;max-width:420px;'></select></div>");
+    httpd_resp_sendstr_chunk(req, "<h3>Font Library</h3>");
+    httpd_resp_sendstr_chunk(req, "<p>Upload LVGL binary font (.bin). File will be saved to <code>/fonts/chs_16.bin</code> on the SD card.</p>");
+    httpd_resp_sendstr_chunk(req, "<div><input type='file' id='fontfile' accept='.bin'> <button type='button' id='uploadfont'>Upload Font</button> <span id='fontstatus' style='margin-left:8px;color:#555;'></span></div>");
     httpd_resp_sendstr_chunk(req, "<script>\nconst btn=document.getElementById('scan');\nconst list=document.getElementById('ssidlist');\nconst sel=document.getElementById('ssidsel');\nconst ssid=document.getElementById('ssid');\nfunction authText(a){switch(a){case 0:return 'OPEN';case 1:return 'WEP';case 2:return 'WPA_PSK';case 3:return 'WPA2_PSK';case 4:return 'WPA_WPA2';case 5:return 'WPA2_ENT';case 6:return 'WPA3_PSK';case 7:return 'WPA2_WPA3';case 8:return 'OWE';default:return 'UNK';}}\nfunction fillLists(data){list.innerHTML='';sel.innerHTML='';let seen={};data.sort((a,b)=>b.rssi-a.rssi).forEach(ap=>{if(!ap||!ap.ssid||seen[ap.ssid])return;seen[ap.ssid]=1;const o=document.createElement('option');o.value=ap.ssid;list.appendChild(o);const opt=document.createElement('option');const ch=(ap.chan!=null?ap.chan:'?');opt.textContent=ap.ssid+'  (ch '+ch+', '+authText(ap.auth)+', '+ap.rssi+' dBm)';opt.value=ap.ssid;sel.appendChild(opt);});}\nsel.addEventListener('change',()=>{if(sel.value)ssid.value=sel.value;});\nasync function pollResult(maxTry=30){for(let i=0;i<maxTry;i++){let r=await fetch('/scan_result',{cache:'no-store'});if(!r.ok)throw new Error('result failed');let data=await r.json();if(Array.isArray(data)){return data;}if(data&&data.status!=='pending'){break;}await new Promise(res=>setTimeout(res,300));}throw new Error('timeout');}\nbtn&&btn.addEventListener('click',async()=>{btn.disabled=true;btn.textContent='Scanning...';try{const s=await fetch('/scan_start',{cache:'no-store'});if(!s.ok)throw new Error('start failed');const data=await pollResult();fillLists(data);if(data.length===0)alert('No AP found');}catch(e){alert('Scan failed');}finally{btn.disabled=false;btn.textContent='Scan Wi-Fi';}});\n</script>");
+    httpd_resp_sendstr_chunk(req, "<script>\nconst fontInput=document.getElementById('fontfile');\nconst fontBtn=document.getElementById('uploadfont');\nconst fontStatus=document.getElementById('fontstatus');\nfunction fontSetStatus(msg,color){if(fontStatus){fontStatus.textContent=msg;fontStatus.style.color=color||'#555';}}\nfontBtn&&fontBtn.addEventListener('click',async()=>{if(!fontInput||!fontInput.files||fontInput.files.length===0){alert('Choose a .bin font file');return;}const file=fontInput.files[0];fontBtn.disabled=true;const origText=fontBtn.textContent;fontSetStatus('Uploading...','#555');fontBtn.textContent='Uploading...';try{const resp=await fetch('/upload_font',{method:'POST',headers:{'Content-Type':'application/octet-stream','X-Filename':file.name||''},body:file});const txt=await resp.text();let data=null;try{data=JSON.parse(txt);}catch(e){}if(resp.ok){let msg='Upload ok';if(data&&typeof data.size==='number'){msg='Uploaded '+data.size+' bytes';}if(data&&data.reloaded===true){msg+=' (font applied)';}fontSetStatus(msg,'#0a0');setTimeout(()=>location.reload(),800);}else{const err=(data&&data.error)?data.error:(txt||'Upload failed');fontSetStatus(err,'#a00');}}catch(e){fontSetStatus('Upload failed','#a00');}finally{fontBtn.disabled=false;fontBtn.textContent=origText;}});\n</script>");
     httpd_resp_sendstr_chunk(req, "<h3>Files</h3><ul>");
     DIR *d = opendir("/sdcard");
     if (d) {
@@ -242,6 +248,88 @@ static esp_err_t scan_result_get_handler(httpd_req_t *req)
     return httpd_resp_sendstr(req, "[]");
 }
 
+static esp_err_t upload_font_post_handler(httpd_req_t *req)
+{
+    const size_t max_font_size = 6 * 1024 * 1024;
+    if (req->content_len == 0 || req->content_len > max_font_size) {
+        httpd_resp_set_status(req, req->content_len > max_font_size ? "413 Payload Too Large" : "400 Bad Request");
+        return httpd_resp_sendstr(req, req->content_len > max_font_size ? "font file too large" : "empty body");
+    }
+
+    struct stat st;
+    if (stat("/sdcard", &st) != 0 || !S_ISDIR(st.st_mode)) {
+        return httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "sd not mounted");
+    }
+    if (stat("/sdcard/fonts", &st) != 0) {
+        if (mkdir("/sdcard/fonts", 0775) != 0 && errno != EEXIST) {
+            return httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "mkdir failed");
+        }
+    }
+
+    char header_name[96] = {0};
+    if (httpd_req_get_hdr_value_str(req, "X-Filename", header_name, sizeof(header_name)) != ESP_OK) {
+        strcpy(header_name, "font.bin");
+    }
+    char *basename = header_name;
+    for (char *p = header_name; *p; ++p) {
+        if (*p == '/' || *p == '\\') {
+            basename = p + 1;
+        }
+    }
+
+    const char *tmp_path = "/sdcard/fonts/chs_16.bin.tmp";
+    const char *final_path = "/sdcard/fonts/chs_16.bin";
+    FILE *fp = fopen(tmp_path, "wb");
+    if (!fp) {
+        ESP_LOGE(TAG, "Failed to open temp font file");
+        return httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "open failed");
+    }
+
+    size_t total = 0;
+    uint8_t buf[1024];
+    while (total < req->content_len) {
+        size_t to_read = req->content_len - total;
+        if (to_read > sizeof(buf)) {
+            to_read = sizeof(buf);
+        }
+        int r = httpd_req_recv(req, (char *)buf, to_read);
+        if (r == HTTPD_SOCK_ERR_TIMEOUT) {
+            continue;
+        }
+        if (r <= 0) {
+            fclose(fp);
+            unlink(tmp_path);
+            ESP_LOGE(TAG, "recv err %d", r);
+            return httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "recv failed");
+        }
+        if (fwrite(buf, 1, r, fp) != (size_t)r) {
+            fclose(fp);
+            unlink(tmp_path);
+            ESP_LOGE(TAG, "write err");
+            return httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "write failed");
+        }
+        total += r;
+    }
+    fflush(fp);
+    fsync(fileno(fp));
+    fclose(fp);
+
+    unlink(final_path);
+    if (rename(tmp_path, final_path) != 0) {
+        unlink(tmp_path);
+        ESP_LOGE(TAG, "rename failed: %d", errno);
+        return httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "rename failed");
+    }
+
+    bool reloaded = ui_reload_font_from_sd();
+    ESP_LOGI(TAG, "Uploaded font %s (%zu bytes), reload=%s", basename, total, reloaded ? "true" : "false");
+
+    httpd_resp_set_type(req, "application/json; charset=utf-8");
+    char resp[160];
+    snprintf(resp, sizeof(resp), "{\"status\":\"ok\",\"size\":%zu,\"reloaded\":%s}", total, reloaded ? "true" : "false");
+    return httpd_resp_sendstr(req, resp);
+}
+
 static esp_err_t download_get_handler(httpd_req_t *req)
 {
     char query[256]; char f[192];
@@ -312,12 +400,14 @@ esp_err_t http_server_start(httpd_handle_t *out)
     httpd_uri_t provision = { .uri = "/provision", .method = HTTP_POST, .handler = provision_post_handler, .user_ctx = NULL };
     httpd_uri_t scan_start = { .uri = "/scan_start", .method = HTTP_GET, .handler = scan_start_get_handler, .user_ctx = NULL };
     httpd_uri_t scan_result = { .uri = "/scan_result", .method = HTTP_GET, .handler = scan_result_get_handler, .user_ctx = NULL };
+    httpd_uri_t upload_font = { .uri = "/upload_font", .method = HTTP_POST, .handler = upload_font_post_handler, .user_ctx = NULL };
     httpd_uri_t download = { .uri = "/download", .method = HTTP_GET, .handler = download_get_handler, .user_ctx = NULL };
     httpd_uri_t del = { .uri = "/delete", .method = HTTP_GET, .handler = delete_get_handler, .user_ctx = NULL };
     httpd_register_uri_handler(server, &root);
     httpd_register_uri_handler(server, &provision);
     httpd_register_uri_handler(server, &scan_start);
     httpd_register_uri_handler(server, &scan_result);
+    httpd_register_uri_handler(server, &upload_font);
     httpd_register_uri_handler(server, &download);
     httpd_register_uri_handler(server, &del);
     s_server = server;

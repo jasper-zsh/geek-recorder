@@ -62,13 +62,33 @@ void app_main(void)
 
     ESP_ERROR_CHECK(nvs_flash_init());
 
-    ui_init();
-
+    /* Stage 1: peripherals */
+    ESP_LOGI(TAG, "Initializing peripherals");
     bool sd_ok = sdcard_mount();
     if (!sd_ok) {
         ESP_LOGW(TAG, "SD card not mounted");
     }
 
+    bool mic_ok = false;
+    if (sd_ok) {
+        if (mic_init() == ESP_OK) {
+            mic_ok = true;
+        } else {
+            ESP_LOGE(TAG, "Mic init failed");
+        }
+    } else {
+        ESP_LOGW(TAG, "Skip mic init (SD unavailable)");
+    }
+
+    /* Stage 2: UI */
+    ESP_LOGI(TAG, "Initializing UI");
+    ui_init();
+    if (sd_ok) {
+        ui_post_sd_init();
+    }
+
+    /* Stage 3: network */
+    ESP_LOGI(TAG, "Initializing network");
     wifi_mgr_init();
     ui_start_status_task();
 
@@ -83,15 +103,11 @@ void app_main(void)
         vTaskDelay(pdMS_TO_TICKS(2000));
     }
 
-    if (sd_ok && mic_init() == ESP_OK) {
+    /* Stage 4: other modules */
+    if (mic_ok) {
         mic_start_task();
     }
-
     http_server_start(NULL);
-
-    if (sd_ok) {
-        ui_post_sd_init();
-    }
 
     ESP_LOGI(TAG, "System initialized");
 }

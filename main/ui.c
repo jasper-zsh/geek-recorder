@@ -1,5 +1,6 @@
 #include <string.h>
 #include <stdio.h>
+#include <stdlib.h>
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -39,11 +40,122 @@ static const char *TAG = "ui";
 static esp_lcd_panel_handle_t s_panel_handle = NULL;
 static SemaphoreHandle_t s_lcd_mutex = NULL;
 static bool s_lvgl_ok = false;
-static lv_obj_t *s_label = NULL;
-static lv_obj_t *s_status_label = NULL;
-#if LV_USE_FONT_LOADER
+static lv_obj_t *s_top_bar = NULL;  // Top status bar (WiFi and IP)
+static lv_obj_t *s_content_container = NULL;  // Scrollable content container
+static lv_obj_t *s_content = NULL;  // Transcript label inside container
+static lv_obj_t *s_bottom_bar = NULL;  // Bottom status bar (REC status and duration)
+static lv_obj_t *s_asr_status = NULL;  // ASR status label (bottom right)
+static const lv_font_t *s_font_default = NULL;
 static const lv_font_t *s_font_chs = NULL;
+#if LV_USE_FONT_LOADER
+static lv_font_t *s_font_dynamic = NULL;
+static bool s_lvgl_fs_registered = false;
 #endif
+static char s_transcript_buf[4096];
+static char s_partial_buf[512];
+static time_t s_rec_start_time = 0;  // Recording start time for duration calculation
+
+static void ui_scroll_to_bottom_locked(void)
+{
+    if (!s_content_container) {
+        return;
+    }
+    if (s_content) {
+        lv_obj_update_layout(s_content);
+    }
+    lv_obj_update_layout(s_content_container);
+    lv_coord_t bottom = lv_obj_get_scroll_bottom(s_content_container);
+    lv_obj_scroll_to_y(s_content_container, bottom, LV_ANIM_OFF);
+}
+
+static void ui_refresh_transcript_locked(void)
+{
+    if (!(s_lvgl_ok && s_content)) {
+        return;
+    }
+    size_t base_len = strlen(s_transcript_buf);
+    size_t partial_len = strlen(s_partial_buf);
+    size_t total_len = base_len + partial_len + 1;
+    char *buf = malloc(total_len ? total_len : 1);
+    if (!buf) {
+        return;
+    }
+    if (base_len) memcpy(buf, s_transcript_buf, base_len);
+    if (partial_len) memcpy(buf + base_len, s_partial_buf, partial_len);
+    buf[base_len + partial_len] = '\0';
+    lvgl_port_lock();
+    lv_label_set_text(s_content, buf);
+    // Auto-scroll to bottom
+    ui_scroll_to_bottom_locked();
+    lvgl_port_unlock();
+    free(buf);
+}
+
+static void transcript_append_locked(const char *text)
+{
+    if (!text) {
+        return;
+    }
+    size_t text_len = strlen(text);
+    if (text_len == 0) {
+        return;
+    }
+    size_t max_payload = sizeof(s_transcript_buf) - 2;
+    if (text_len > max_payload) {
+        text += text_len - max_payload;
+        text_len = max_payload;
+    }
+    size_t len = strlen(s_transcript_buf);
+    size_t need = text_len + 1; // newline + null terminator handled below
+    if (len + need > sizeof(s_transcript_buf) - 1) {
+        size_t overflow = len + need - (sizeof(s_transcript_buf) - 1);
+        if (overflow > len) overflow = len;
+        memmove(s_transcript_buf, s_transcript_buf + overflow, len - overflow + 1);
+        len -= overflow;
+    }
+    memcpy(s_transcript_buf + len, text, text_len);
+    len += text_len;
+    s_transcript_buf[len++] = '\n';
+    s_transcript_buf[len] = '\0';
+}
+
+static void ui_apply_font_locked(const lv_font_t *font)
+{
+    const lv_font_t *effective = font ? font : s_font_default;
+    if (!effective) {
+        effective = lv_font_default();
+    }
+    if (s_top_bar && effective) {
+        lv_obj_set_style_text_font(s_top_bar, effective, LV_PART_MAIN);
+    }
+    if (s_bottom_bar && effective) {
+        lv_obj_set_style_text_font(s_bottom_bar, effective, LV_PART_MAIN);
+    }
+    if (s_asr_status && effective) {
+        lv_obj_set_style_text_font(s_asr_status, effective, LV_PART_MAIN);
+    }
+    if (s_content && effective) {
+        lv_obj_set_style_text_font(s_content, effective, LV_PART_MAIN);
+    }
+    if (s_content_container) {
+        const lv_font_t *st_font = effective;
+        if (s_top_bar) {
+            const lv_font_t *from_style = lv_obj_get_style_text_font(s_top_bar, LV_PART_MAIN);
+            if (from_style) {
+                st_font = from_style;
+            }
+        }
+        int lh = st_font ? lv_font_get_line_height(st_font) : 16;
+        if (lh <= 0) {
+            lh = 16;
+        }
+        // Update content area position based on top bar height
+        lv_obj_align_to(s_content_container, s_top_bar, LV_ALIGN_OUT_BOTTOM_LEFT, 0, 0);
+        lv_obj_set_width(s_content_container, LCD_HRES);
+        // Calculate height: total height minus top bar height minus bottom bar height
+        lv_obj_set_height(s_content_container, LCD_VRES - 2 * lh);
+    }
+}
 
 static void set_gpio_output(int gpio, int level)
 {
@@ -117,19 +229,59 @@ static esp_err_t lcd_init_internal(void)
         lv_obj_t *scr = lv_scr_act();
         lv_obj_set_style_bg_color(scr, lv_color_hex(0x000000), 0);
         lv_obj_set_style_bg_opa(scr, LV_OPA_COVER, 0);
-        s_status_label = lv_label_create(lv_scr_act());
-        lv_obj_set_width(s_status_label, LCD_HRES);
-        lv_obj_align(s_status_label, LV_ALIGN_TOP_LEFT, 0, 0);
-        lv_obj_set_style_text_color(s_status_label, lv_color_hex(0xFFFFFF), 0);
-        lv_obj_set_style_text_opa(s_status_label, LV_OPA_COVER, 0);
-        s_label = lv_label_create(lv_scr_act());
-        lv_obj_set_width(s_label, LCD_HRES);
-        lv_label_set_long_mode(s_label, LV_LABEL_LONG_WRAP);
-        const lv_font_t *st_font = lv_obj_get_style_text_font(s_status_label, LV_PART_MAIN);
-        int lh = st_font ? lv_font_get_line_height(st_font) : 16;
-        if (lh <= 0) lh = 16;
-        lv_obj_align(s_label, LV_ALIGN_TOP_LEFT, 0, lh + 2);
-        lv_label_set_text(s_label, "");
+        
+        // Create top status bar (WiFi and IP address)
+        s_top_bar = lv_label_create(lv_scr_act());
+        lv_obj_set_width(s_top_bar, LCD_HRES);
+        lv_obj_align(s_top_bar, LV_ALIGN_TOP_LEFT, 0, 0);
+        lv_obj_set_style_text_color(s_top_bar, lv_color_hex(0xFFFFFF), 0);
+        lv_obj_set_style_text_opa(s_top_bar, LV_OPA_COVER, 0);
+        lv_label_set_text(s_top_bar, "Initializing...");
+        
+        // Create ASR status label (positioned at bottom right)
+        s_asr_status = lv_label_create(lv_scr_act());
+        lv_obj_set_style_text_color(s_asr_status, lv_color_hex(0xFFFFFF), 0);
+        lv_obj_set_style_text_opa(s_asr_status, LV_OPA_COVER, 0);
+        lv_label_set_text(s_asr_status, "ASR:OFF");
+        lv_obj_align(s_asr_status, LV_ALIGN_BOTTOM_RIGHT, 0, 0);
+        
+        // Create bottom status bar (REC status and duration)
+        s_bottom_bar = lv_label_create(lv_scr_act());
+        lv_obj_set_width(s_bottom_bar, LCD_HRES - 80);  // Leave room for ASR status label
+        lv_obj_align(s_bottom_bar, LV_ALIGN_BOTTOM_LEFT, 0, 0);
+        lv_obj_set_style_text_color(s_bottom_bar, lv_color_hex(0xFFFFFF), 0);
+        lv_obj_set_style_text_opa(s_bottom_bar, LV_OPA_COVER, 0);
+        lv_label_set_text(s_bottom_bar, "Ready");
+        
+        // Create content container (scrollable area between top and bottom bars)
+        s_content_container = lv_obj_create(lv_scr_act());
+        lv_obj_remove_style_all(s_content_container);
+        lv_obj_set_style_bg_opa(s_content_container, LV_OPA_TRANSP, 0);
+        lv_obj_set_style_border_width(s_content_container, 0, 0);
+        lv_obj_set_style_pad_all(s_content_container, 0, 0);
+        lv_obj_set_width(s_content_container, LCD_HRES);
+        lv_obj_align_to(s_content_container, s_top_bar, LV_ALIGN_OUT_BOTTOM_LEFT, 0, 0);
+        lv_obj_set_height(s_content_container, LCD_VRES - 40);  // Will be adjusted in ui_apply_font_locked
+        lv_obj_set_scroll_dir(s_content_container, LV_DIR_VER);
+        lv_obj_set_scrollbar_mode(s_content_container, LV_SCROLLBAR_MODE_AUTO);
+
+        // Create transcript label inside container
+        s_content = lv_label_create(s_content_container);
+        lv_obj_set_width(s_content, LV_PCT(100));
+        lv_label_set_long_mode(s_content, LV_LABEL_LONG_WRAP);
+        lv_label_set_text(s_content, "");
+        lv_obj_set_style_text_color(s_content, lv_color_hex(0xFFFFFF), 0);
+        lv_obj_set_style_text_opa(s_content, LV_OPA_COVER, 0);
+        lv_obj_set_style_pad_all(s_content, 0, 0);
+        lv_obj_set_pos(s_content, 0, 0);
+
+        s_font_default = lv_obj_get_style_text_font(s_top_bar, LV_PART_MAIN);
+        if (!s_font_default) {
+            s_font_default = lv_font_default();
+        }
+        s_font_chs = s_font_default;
+
+        ui_apply_font_locked(s_font_chs);
         lvgl_port_unlock();
     }
 #endif
@@ -149,9 +301,9 @@ void ui_show_text(const char *text)
 {
     if (!s_panel_handle) return;
     if (s_lcd_mutex) xSemaphoreTake(s_lcd_mutex, portMAX_DELAY);
-    if (s_lvgl_ok && s_label) {
+    if (s_lvgl_ok && s_content) {
         lvgl_port_lock();
-        const char *old = lv_label_get_text(s_label);
+        const char *old = lv_label_get_text(s_content);
         size_t old_len = old ? strlen(old) : 0;
         size_t add_len = strlen(text) + 1;
         size_t max_len = 4096;
@@ -164,7 +316,9 @@ void ui_show_text(const char *text)
                 size_t diff = strlen(buf) - max_len;
                 memmove(buf, buf + diff, strlen(buf) - diff + 1);
             }
-            lv_label_set_text(s_label, buf);
+            lv_label_set_text(s_content, buf);
+            // Auto-scroll to bottom
+            ui_scroll_to_bottom_locked();
             free(buf);
         }
         lvgl_port_unlock();
@@ -174,13 +328,39 @@ void ui_show_text(const char *text)
     if (s_lcd_mutex) xSemaphoreGive(s_lcd_mutex);
 }
 
+void ui_transcript_set_partial(const char *text)
+{
+    if (!s_panel_handle) return;
+    if (!text) text = "";
+    if (s_lcd_mutex) xSemaphoreTake(s_lcd_mutex, portMAX_DELAY);
+    snprintf(s_partial_buf, sizeof(s_partial_buf), "%s", text);
+    if (s_lvgl_ok && s_content) {
+        ui_refresh_transcript_locked();
+    }
+    if (s_lcd_mutex) xSemaphoreGive(s_lcd_mutex);
+}
+
+void ui_transcript_add_sentence(const char *text)
+{
+    if (!s_panel_handle || !text) return;
+    if (s_lcd_mutex) xSemaphoreTake(s_lcd_mutex, portMAX_DELAY);
+    transcript_append_locked(text);
+    s_partial_buf[0] = '\0';
+    if (s_lvgl_ok && s_content) {
+        ui_refresh_transcript_locked();
+    } else {
+        lcd_text_println(text);
+    }
+    if (s_lcd_mutex) xSemaphoreGive(s_lcd_mutex);
+}
+
 static void ui_update_status_line_once(void)
 {
-    // Wi‑Fi + IP
+    // Top bar: Wi‑Fi + IP (without ASR status)
     wifi_ap_record_t ap;
     bool wifi_ok = (esp_wifi_sta_get_ap_info(&ap) == ESP_OK);
     char wifi_part[48];
-    if (wifi_ok) snprintf(wifi_part, sizeof(wifi_part), "WiFi:%s %ddBm", (char*)ap.ssid, ap.rssi);
+    if (wifi_ok) snprintf(wifi_part, sizeof(wifi_part), "WiFi:%s", (char*)ap.ssid);
     else snprintf(wifi_part, sizeof(wifi_part), "WiFi:--");
 
     char ip_part[24];
@@ -192,7 +372,10 @@ static void ui_update_status_line_once(void)
         strcpy(ip_part, "0.0.0.0");
     }
 
-    char rec_part[12]; snprintf(rec_part, sizeof(rec_part), "REC:%s", mic_is_recording() ? "ON" : "OFF");
+    char top_line[160];
+    snprintf(top_line, sizeof(top_line), "%s | %s", wifi_part, ip_part);
+
+    // ASR status (bottom right)
     const bool asr_conn = asr_ws_connected();
     const bool asr_strm = asr_ws_streaming();
     char asr_part[12];
@@ -200,20 +383,50 @@ static void ui_update_status_line_once(void)
     else if (asr_strm) snprintf(asr_part, sizeof(asr_part), "ASR:ON");
     else snprintf(asr_part, sizeof(asr_part), "ASR:RDY");
 
-    time_t now = time(NULL); struct tm tm; localtime_r(&now, &tm);
-    char tbuf[12]; snprintf(tbuf, sizeof(tbuf), "%02d:%02d:%02d", tm.tm_hour, tm.tm_min, tm.tm_sec);
+    // Bottom bar: REC status + duration
+    bool is_recording = mic_is_recording();
+    char rec_part[12]; 
+    snprintf(rec_part, sizeof(rec_part), "REC:%s", is_recording ? "ON" : "OFF");
+    
+    char duration_part[16] = "";
+    if (is_recording && s_rec_start_time > 0) {
+        time_t now = time(NULL);
+        int duration = now - s_rec_start_time;
+        int hours = duration / 3600;
+        int minutes = (duration % 3600) / 60;
+        int seconds = duration % 60;
+        if (hours > 0) {
+            snprintf(duration_part, sizeof(duration_part), "%02d:%02d:%02d", hours, minutes, seconds);
+        } else {
+            snprintf(duration_part, sizeof(duration_part), "%02d:%02d", minutes, seconds);
+        }
+    } else if (!is_recording) {
+        s_rec_start_time = 0;  // Reset start time when not recording
+    }
 
-    char line[160];
-    snprintf(line, sizeof(line), "%s  |  IP:%s  |  %s  |  %s  |  %s",
-             wifi_part, ip_part, rec_part, asr_part, tbuf);
+    char bottom_line[80];
+    if (strlen(duration_part) > 0) {
+        snprintf(bottom_line, sizeof(bottom_line), "%s | %s", rec_part, duration_part);
+    } else {
+        snprintf(bottom_line, sizeof(bottom_line), "%s", rec_part);
+    }
 
     if (s_lcd_mutex) xSemaphoreTake(s_lcd_mutex, portMAX_DELAY);
-    if (s_lvgl_ok && s_status_label) {
+    if (s_lvgl_ok) {
         lvgl_port_lock();
-        lv_label_set_text(s_status_label, line);
+        // Update top bar (WiFi and IP)
+        if (s_top_bar) {
+            lv_label_set_text(s_top_bar, top_line);
+        }
+        // Update ASR status (bottom right)
+        if (s_asr_status) {
+            lv_label_set_text(s_asr_status, asr_part);
+        }
+        // Update bottom bar
+        if (s_bottom_bar) {
+            lv_label_set_text(s_bottom_bar, bottom_line);
+        }
         lvgl_port_unlock();
-    } else {
-        lcd_text_set_status_line(line);
     }
     if (s_lcd_mutex) xSemaphoreGive(s_lcd_mutex);
 }
@@ -238,22 +451,80 @@ void ui_start_status_task(void)
 
 void ui_post_sd_init(void)
 {
-#ifdef CONFIG_GEEK_USE_LVGL
-    if (s_lvgl_ok) {
-        lvgl_fs_sd_register();
-        lvgl_port_lock();
-#if LV_USE_FONT_LOADER
-        s_font_chs = lv_font_load("S:/fonts/chs_16.bin");
-        if (s_font_chs && s_label) {
-            lv_obj_set_style_text_font(s_label, s_font_chs, LV_PART_MAIN);
-            ESP_LOGI(TAG, "Loaded LVGL font from SD");
-        } else if (!s_font_chs) {
-            ESP_LOGW(TAG, "Failed to load font from SD; using default");
-        }
+    ESP_LOGI(TAG, "Running post SD init tasks");
+#if defined(CONFIG_GEEK_USE_LVGL)
+    ESP_LOGI(TAG, "CONFIG_GEEK_USE_LVGL enabled");
 #else
-        ESP_LOGW(TAG, "LV_USE_FONT_LOADER=0; cannot load font from SD");
+    ESP_LOGW(TAG, "CONFIG_GEEK_USE_LVGL not defined");
 #endif
-        lvgl_port_unlock();
+#ifdef LV_USE_FONT_LOADER
+    ESP_LOGI(TAG, "LV_USE_FONT_LOADER=%d", LV_USE_FONT_LOADER);
+#else
+    ESP_LOGW(TAG, "LV_USE_FONT_LOADER not defined");
+#endif
+    ui_reload_font_from_sd();
+}
+
+bool ui_reload_font_from_sd(void)
+{
+#if defined(CONFIG_GEEK_USE_LVGL) && LV_USE_FONT_LOADER
+    if (!s_lvgl_ok) {
+        ESP_LOGW(TAG, "LVGL not ready; skip font reload");
+        return false;
     }
+    if (!s_lvgl_fs_registered) {
+        ESP_LOGI(TAG, "Registering LVGL SD filesystem");
+        lvgl_fs_sd_register();
+        s_lvgl_fs_registered = true;
+    }
+    lvgl_port_lock();
+    const char *font_path = "S:fonts/chs_16.bin";
+    lv_fs_file_t font_file;
+    lv_fs_res_t fs_res = lv_fs_open(&font_file, font_path, LV_FS_MODE_RD);
+    if (fs_res == LV_FS_RES_OK) {
+        uint32_t size = 0;
+        if (lv_fs_seek(&font_file, 0, LV_FS_SEEK_END) == LV_FS_RES_OK &&
+            lv_fs_tell(&font_file, &size) == LV_FS_RES_OK) {
+            ESP_LOGI(TAG, "Font file found via LVGL FS: %u bytes", (unsigned)size);
+        } else {
+            ESP_LOGW(TAG, "Font file opened but size unknown (seek/tell failed)");
+        }
+        lv_fs_close(&font_file);
+    } else {
+        ESP_LOGE(TAG, "Font file open failed (%d)", fs_res);
+    }
+    ESP_LOGI(TAG, "Loading LVGL font from %s", font_path);
+    lv_font_t *new_font = lv_font_load(font_path);
+    if (!new_font) {
+        if (s_font_dynamic) {
+            lv_font_free(s_font_dynamic);
+            s_font_dynamic = NULL;
+        }
+        s_font_chs = s_font_default;
+        ui_apply_font_locked(s_font_chs);
+        lvgl_port_unlock();
+        ESP_LOGW(TAG, "Font load failed; using default font");
+        return false;
+    }
+    lv_font_t *old_font = s_font_dynamic;
+    s_font_dynamic = new_font;
+    s_font_chs = s_font_dynamic;
+    ui_apply_font_locked(s_font_chs);
+    if (old_font) {
+        lv_font_free(old_font);
+    }
+    lvgl_port_unlock();
+    ESP_LOGI(TAG, "Loaded LVGL font from SD");
+    return true;
+#else
+    ESP_LOGW(TAG, "LVGL font loader disabled; skip font reload");
+    return false;
 #endif
+}
+
+void ui_record_started(void)
+{
+    if (s_lvgl_ok) {
+        s_rec_start_time = time(NULL);
+    }
 }

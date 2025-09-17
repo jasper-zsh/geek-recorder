@@ -14,6 +14,7 @@
 
 #include "cJSON.h"
 #include "asr_ws.h"
+#include "ui.h"
 
 static const char *TAG = "asr_ws";
 
@@ -154,6 +155,7 @@ static void ws_handle_text_message(const char *json_text)
     if (strcmp(event_str, "task-started") == 0) {
         ESP_LOGI(TAG, "task-started received");
         s_task_state = WS_TASK_STREAMING;
+        ui_transcript_set_partial("");
         if (!s_ws_desired_streaming || s_pending_finish) {
             // Request was cancelled while waiting for start.
             ws_send_finish_task();
@@ -180,14 +182,17 @@ static void ws_handle_text_message(const char *json_text)
                     const cJSON *text = cJSON_GetObjectItemCaseSensitive(sentence, "text");
                     if (cJSON_IsString(text) && text->valuestring && cJSON_IsBool(sentence_end) && cJSON_IsTrue(sentence_end)) {
                         ESP_LOGI(TAG, "ASR sentence: %s", text->valuestring);
+                        ui_transcript_add_sentence(text->valuestring);
                     } else if (cJSON_IsString(text) && text->valuestring) {
                         ESP_LOGD(TAG, "ASR partial: %s", text->valuestring);
+                        ui_transcript_set_partial(text->valuestring);
                     }
                 }
             }
         }
     } else if (strcmp(event_str, "task-finished") == 0) {
         ESP_LOGI(TAG, "task-finished received");
+        ui_transcript_set_partial("");
         ws_reset_task_tracking();
         ws_maybe_start_task();
     } else if (strcmp(event_str, "task-failed") == 0) {
@@ -195,6 +200,7 @@ static void ws_handle_text_message(const char *json_text)
         const cJSON *message = cJSON_GetObjectItemCaseSensitive(header, "error_message");
         ESP_LOGE(TAG, "task-failed: code=%s msg=%s", cJSON_IsString(code) && code->valuestring ? code->valuestring : "<none>",
                  cJSON_IsString(message) && message->valuestring ? message->valuestring : "<none>");
+        ui_transcript_set_partial("");
         ws_reset_task_tracking();
         ws_maybe_start_task();
     } else {
